@@ -10,12 +10,11 @@ use serde_derive::Deserialize;
 struct Response {
     #[serde(with = "super::protocol::format")]
     _format: (),
-    #[serde(rename = "systemFolders")]
-    system_folders: SystemFolders,
+    folders: Folders
 }
 
 #[derive(Deserialize)]
-struct SystemFolders {
+struct Folders {
     folders: String,
 }
 
@@ -31,7 +30,7 @@ pub fn fetch_mailbox<C: 'static + hyper::client::connect::Connect>(
     super::authenticated_get::get(client, access_token, &url).and_then(|response_body| {
         match serde_json::from_slice::<Response>(&response_body) {
             Err(error) => Err(Error::Format(error)),
-            Ok(response_data) => Ok(response_data.system_folders.folders),
+            Ok(response_data) => Ok(response_data.folders.folders),
         }
     })
 }

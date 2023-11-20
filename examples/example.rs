@@ -8,19 +8,17 @@ use futures::{
 };
 
 enum Operation {
-    CreateDraft,
-    CreateFolder,
-    ManageFolders,
-    ToggleRead,
     ViewMail,
 }
+
+use lz4_flex::block::decompress_into;
 
 fn main() {
     let mut arguments = std::env::args();
     let program = arguments.next().unwrap();
     let quit = || {
         eprintln!(
-            "Usage: {} email_address create_folder|manage_folders|view_mail|toggle_read",
+            "Usage: {} email_address view_mail",
             program
         );
         std::process::exit(1);
@@ -30,10 +28,6 @@ fn main() {
     }
     let email_address = arguments.next().unwrap();
     let operation = match &arguments.next().unwrap() as _ {
-        "create_draft" => Operation::CreateDraft,
-        "create_folder" => Operation::CreateFolder,
-        "manage_folders" => Operation::ManageFolders,
-        "toggle_read" => Operation::ToggleRead,
         "view_mail" => Operation::ViewMail,
         _ => quit(),
     };
@@ -96,12 +90,6 @@ fn main() {
                                     .and_then(move |folders| -> Box<dyn Future<Error = _, Item = _> + Send> {
                                         // XXX avoid panic
                                         match operation {
-                                            Operation::CreateDraft => Box::new(create_draft(&client, &email_address, &access_token, mail_group_key, user_group_key)),
-                                            Operation::CreateFolder => Box::new(tutanota_client::create_mail_folder::create_mail_folder(&client, &access_token, mail_group_key, tutanota_client::create_key(), &folders[0].id, "Test created!").map(|folder| {
-                                                dbg!(folder);
-                                            })),
-                                            Operation::ManageFolders => Box::new(manage_folders(client, access_token, mail_group_key, &folders[0].sub_folders)),
-                                            Operation::ToggleRead => Box::new(toggle_read(client, access_token, &folders[0].mails)),
                                             Operation::ViewMail => Box::new(fetch_mails(client, access_token, mail_group_key, &folders[0].mails)),
                                         }
                                     })
@@ -132,42 +120,6 @@ fn main() {
                 }
             })
     }));
-}
-
-fn create_draft<C: 'static + hyper::client::connect::Connect>(
-    client: &hyper::Client<C, hyper::Body>,
-    email_address: &str,
-    access_token: &str,
-    mail_group_key: [u8; 16],
-    user_group_key: [u8; 16],
-) -> impl Future<Error = tutanota_client::Error, Item = ()> {
-    let session_key = tutanota_client::create_key();
-    let sub_keys = tutanota_client::SubKeys::new(session_key);
-    tutanota_client::create_draft::create_draft(client, access_token, session_key, mail_group_key, user_group_key, tutanota_client::create_draft::DraftData {
-        added_attachments: &[],
-        bcc_recipients: &[],
-        body_text: tutanota_client::encrypt_with_mac(&sub_keys, b"This is a test message."),
-        cc_recipients: &[],
-        // XXX What's this for?
-        confidential: tutanota_client::encrypt_with_mac(&sub_keys, b"0"),
-        // XXX What's this for?
-        id: "xxxxxx",
-        removed_attachments: &[],
-        reply_tos: &[],
-        sender_mail_address: email_address,
-        sender_name: tutanota_client::encrypt_with_mac(&sub_keys, b"Bob"),
-        subject: tutanota_client::encrypt_with_mac(&sub_keys, b"Hello, World!"),
-        to_recipients: &[
-            tutanota_client::create_draft::Recipient {
-                // XXX What's this for?
-                id: "xxxxxx",
-                mail_address: "alice@example.com",
-                name: tutanota_client::encrypt_with_mac(&sub_keys, b"Alice"),
-            }
-        ],
-    }).map(|draft| {
-        dbg!(draft);
-    })
 }
 
 fn fetch_mails<C: 'static + hyper::client::connect::Connect>(
@@ -204,172 +156,21 @@ fn fetch_mail_contents<C: 'static + hyper::client::connect::Connect>(
     mail_group_key: [u8; 16],
     mail: tutanota_client::mail::Mail,
 ) -> impl Future<Error = tutanota_client::Error, Item = ()> {
-    let attachment_future = match mail.attachments.first() {
-        None => Either::A(future::ok(None)),
-        Some(attachment) => {
-            let file_future = tutanota_client::file::fetch_file(&client, &access_token, attachment);
-            let filedata_future =
-                tutanota_client::filedata::fetch_filedata(&client, &access_token, attachment)
-                    .and_then(|response| {
-                        response.concat2().map_err(tutanota_client::Error::Network)
-                    });
-            Either::B(file_future.join(filedata_future).map(Some))
-        }
-    };
+    println!("Num attachments: {}", mail.attachments.len());
     let mailbody_future =
         tutanota_client::mailbody::fetch_mailbody(&client, &access_token, &mail.body);
-    let session_key = mail.owner_enc_session_key;
-    attachment_future
-        .join(mailbody_future)
-        .map(move |(file, text)| {
+    let session_key = tutanota_client::decrypt_key(&mail_group_key, &mail.owner_enc_session_key).unwrap();
+    let session_sub_keys = tutanota_client::SubKeys::new(session_key);
+    mailbody_future
+        .map(move |text| {
             // XXX avoid panic
-            let session_key = tutanota_client::decrypt_key(&mail_group_key, &session_key).unwrap();
-            let session_sub_keys = tutanota_client::SubKeys::new(session_key);
+            let compressed_text = tutanota_client::decrypt_with_mac(&session_sub_keys, &text).unwrap();
+
+            let mut buf : Vec<u8> = vec![0; text.len() * 6];
+            let size = decompress_into(&compressed_text, &mut buf).unwrap();
+            buf.resize(size, 0);
+
             // XXX avoid panic
-            let text = tutanota_client::decrypt_with_mac(&session_sub_keys, &text).unwrap();
-            // XXX avoid panic
-            println!("mail body: {}", std::str::from_utf8(&text).unwrap());
-            if let Some((file, file_data)) = file {
-                // XXX avoid panic
-                let session_key =
-                    tutanota_client::decrypt_key(&mail_group_key, &file.owner_enc_session_key)
-                        .unwrap();
-                let session_sub_keys = tutanota_client::SubKeys::new(session_key);
-                // XXX avoid panic
-                let mime_type =
-                    tutanota_client::decrypt_with_mac(&session_sub_keys, &file.mime_type).unwrap();
-                // XXX avoid panic
-                let name =
-                    tutanota_client::decrypt_with_mac(&session_sub_keys, &file.name).unwrap();
-                // XXX avoid panic
-                println!(
-                    "attachment, mime type: {:?}, name: {:?}, size: {:?}",
-                    std::str::from_utf8(&mime_type).unwrap(),
-                    std::str::from_utf8(&name).unwrap(),
-                    file.size
-                );
-                // XXX avoid panic
-                let file_data =
-                    tutanota_client::decrypt_with_mac(&session_sub_keys, &file_data).unwrap();
-                println!("file data: {:?}", std::str::from_utf8(&file_data));
-            }
+            println!("mail body: {}", std::str::from_utf8(&buf).unwrap());
         })
-}
-
-fn manage_folders<C: 'static + hyper::client::connect::Connect>(
-    client: hyper::Client<C, hyper::Body>,
-    access_token: String,
-    mail_group_key: [u8; 16],
-    folders: &str,
-) -> impl Future<Error = tutanota_client::Error, Item = ()> {
-    tutanota_client::mailfolder::fetch_mailfolder(&client, &access_token, folders).and_then(
-        move |folders| {
-            let mut delete_id = None;
-            let mut move_from_mails = None;
-            let mut move_to_id = None;
-            let mut rename_folder = None;
-            for folder in folders {
-                // XXX avoid panic
-                let session_key =
-                    tutanota_client::decrypt_key(&mail_group_key, &folder.owner_enc_session_key)
-                        .unwrap();
-                let session_sub_keys = tutanota_client::SubKeys::new(session_key);
-                // XXX avoid panic
-                let name =
-                    tutanota_client::decrypt_with_mac(&session_sub_keys, &folder.name).unwrap();
-                // XXX avoid panic
-                println!("folder, name: {:?}", std::str::from_utf8(&name).unwrap(),);
-                if name.starts_with(b"Test delete!") {
-                    delete_id.get_or_insert(folder.id);
-                } else if name.starts_with(b"Test move from!") {
-                    move_from_mails.get_or_insert(folder.mails);
-                } else if name.starts_with(b"Test move to!") {
-                    move_to_id.get_or_insert(folder.id);
-                } else if name.starts_with(b"Test rename!") {
-                    rename_folder.get_or_insert(folder);
-                }
-            }
-            let delete_future = match delete_id {
-                None => Either::A(future::ok(())),
-                Some(id) => Either::B(tutanota_client::delete_mail_folder::delete_mail_folder(
-                    &client,
-                    &access_token,
-                    &id,
-                )),
-            };
-            let rename_future = match rename_folder {
-                None => Either::A(future::ok(())),
-                Some(mut folder) => {
-                    // XXX avoid panic
-                    let session_key = tutanota_client::decrypt_key(
-                        &mail_group_key,
-                        &folder.owner_enc_session_key,
-                    )
-                    .unwrap();
-                    let session_sub_keys = tutanota_client::SubKeys::new(session_key);
-                    folder.name =
-                        tutanota_client::encrypt_with_mac(&session_sub_keys, b"Test renamed!");
-                    Either::B(tutanota_client::update_mail_folder::update_mail_folder(
-                        &client,
-                        &access_token,
-                        &folder,
-                    ))
-                }
-            };
-            let move_future = match (move_from_mails, move_to_id) {
-                (Some(move_from_mails), Some(move_to_id)) => Either::A(move_mail(
-                    client,
-                    access_token,
-                    &move_from_mails,
-                    move_to_id,
-                )),
-                _ => Either::B(future::ok(())),
-            };
-            delete_future
-                .join(move_future)
-                .join(rename_future)
-                .map(|_| ())
-        },
-    )
-}
-
-fn move_mail<C: 'static + hyper::client::connect::Connect>(
-    client: hyper::Client<C, hyper::Body>,
-    access_token: String,
-    mails: &str,
-    move_to_id: (String, String),
-) -> impl Future<Error = tutanota_client::Error, Item = ()> {
-    tutanota_client::mail::fetch_mail(&client, &access_token, mails).and_then(move |mails| {
-        eprintln!("mails to move: {}", mails.len());
-        if mails.is_empty() {
-            Either::A(future::ok(()))
-        } else {
-            let ids: Vec<_> = mails.iter().map(|mail| &mail.id).collect();
-            // XXX avoid panic
-            Either::B(tutanota_client::move_mail::move_mail(
-                &client,
-                &access_token,
-                &ids,
-                &move_to_id,
-            ))
-        }
-    })
-}
-
-fn toggle_read<C: 'static + hyper::client::connect::Connect>(
-    client: hyper::Client<C, hyper::Body>,
-    access_token: String,
-    mails: &str,
-) -> impl Future<Error = tutanota_client::Error, Item = ()> {
-    tutanota_client::mail::fetch_mail(&client, &access_token, mails).and_then(move |mut mails| {
-        // XXX avoid panic
-        let mail = mails.last_mut().unwrap();
-        mail.unread = match &mail.unread as _ {
-            "0" => "1",
-            "1" => "0",
-            _ => panic!(), // XXX avoid panic
-        }
-        .into();
-        tutanota_client::update_mail::update_mail(&client, &access_token, &mail)
-    })
 }

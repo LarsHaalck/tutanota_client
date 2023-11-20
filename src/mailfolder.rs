@@ -7,7 +7,6 @@ use futures::Future;
 use serde_derive::{Deserialize, Serialize};
 
 #[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
 pub struct Folder {
     #[serde(rename = "folderType")]
     pub folder_type: String,
@@ -20,14 +19,6 @@ pub struct Folder {
     pub name: Vec<u8>,
     #[serde(with = "super::protocol::base64", rename = "_ownerEncSessionKey")]
     pub owner_enc_session_key: Vec<u8>,
-    #[serde(rename = "_ownerGroup")]
-    pub owner_group: String,
-    #[serde(rename = "parentFolder")]
-    pub parent_folder: Option<(String, String)>,
-    #[serde(rename = "_permissions")]
-    pub permissions: String,
-    #[serde(rename = "subFolders")]
-    pub sub_folders: String,
 }
 
 pub fn fetch_mailfolder<C: 'static + hyper::client::connect::Connect>(

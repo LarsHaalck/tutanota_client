@@ -10,7 +10,7 @@ use serde_derive::Deserialize;
 pub struct Mailbody {
     #[serde(with = "super::protocol::format")]
     _format: (),
-    #[serde(with = "super::protocol::base64")]
+    #[serde(with = "super::protocol::base64", rename = "compressedText")]
     pub text: Vec<u8>,
 }
 
